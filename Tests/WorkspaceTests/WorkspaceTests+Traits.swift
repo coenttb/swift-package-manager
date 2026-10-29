@@ -2875,4 +2875,67 @@ extension WorkspaceTests {
             XCTAssertEqual(traitlessPackage?.enabledTraits, ["default"])
         }
     }
+
+    /// One parent asks for a package's defaults and another for a named trait. The package is loaded with both,
+    /// whichever of the two requests the workspace registers first.
+    func testDefaultsRequestedAfterNamedTraitAreLoaded() async throws {
+        for sharedFirst in [true, false] {
+            let rootDependencies: [MockDependency] = [
+                .sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"), traits: ["Other"]),
+                .sourceControl(path: "./Parent", requirement: .upToNextMajor(from: "1.0.0")),
+            ]
+            let workspace = try await MockWorkspace(
+                sandbox: AbsolutePath("/tmp/ws/"),
+                fileSystem: InMemoryFileSystem(),
+                roots: [
+                    MockPackage(
+                        name: "Root",
+                        targets: [
+                            MockTarget(
+                                name: "RootTarget",
+                                dependencies: [
+                                    .product(name: "SharedProduct", package: "Shared"),
+                                    .product(name: "ParentProduct", package: "Parent"),
+                                ]
+                            )
+                        ],
+                        dependencies: sharedFirst ? rootDependencies : rootDependencies.reversed()
+                    )
+                ],
+                packages: [
+                    MockPackage(
+                        name: "Parent",
+                        targets: [MockTarget(name: "ParentTarget", dependencies: [.product(name: "SharedProduct", package: "Shared")])],
+                        products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                        dependencies: [.sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"))],
+                        versions: ["1.0.0"]
+                    ),
+                    MockPackage(
+                        name: "Shared",
+                        targets: [
+                            MockTarget(
+                                name: "SharedTarget",
+                                dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                            )
+                        ],
+                        products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                        dependencies: [.sourceControl(path: "./Guarded", requirement: .upToNextMajor(from: "1.0.0"))],
+                        traits: [.init(name: "default", enabledTraits: ["Trait"]), "Trait", "Other"],
+                        versions: ["1.0.0"]
+                    ),
+                    MockPackage(
+                        name: "Guarded",
+                        targets: [MockTarget(name: "GuardedTarget")],
+                        products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                        versions: ["1.0.0"]
+                    ),
+                ]
+            )
+
+            try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+                PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Parent", "Shared", "Guarded") }
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+        }
+    }
 }
