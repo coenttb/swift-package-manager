@@ -3438,6 +3438,17 @@ public class MockContainer: PackageContainer {
 
     public var unversionedDeps: [PackageContainerConstraint] = []
 
+    /// Trait requests on unused dependencies, by version.
+    var unusedDependencyTraitRequests: [String: [PackageContainerConstraint]] = [:]
+
+    public func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) throws -> [PackageContainerConstraint] {
+        self.unusedDependencyTraitRequests[boundVersion.description] ?? []
+    }
+
     /// The list of versions that have incompatible tools version.
     var toolsVersion: ToolsVersion = ToolsVersion.current
     var versionsToolsVersions = [Version: ToolsVersion]()
@@ -3490,7 +3501,10 @@ public class MockContainer: PackageContainer {
             throw _MockLoadingError.unknownRevision
         }
         var filteredDependencies: [MockContainer.Dependency] = []
-        for (product, productDependencies) in revisionDependencies where productFilter.contains(product) {
+        for (product, productDependencies) in revisionDependencies {
+            // A key `product+Trait` lists the product's dependencies that `Trait` guards.
+            let parts = product.split(separator: "+", maxSplits: 1).map(String.init)
+            guard productFilter.contains(parts[0]), parts.count == 1 || enabledTraits.contains(parts[1]) else { continue }
             filteredDependencies.append(contentsOf: productDependencies)
         }
         return filteredDependencies.map({ value in
@@ -3713,6 +3727,19 @@ class DependencyGraphBuilder {
             container.dependencies[version.description, default: [:]][product, default: []] += packageDependencies
         }
         self.containers[packageReference.identity.description] = container
+    }
+
+    /// Makes `package` at `version` request `traits` on `dependency` without using it.
+    func requestTraits(_ traits: Set<String>, on dependency: String, from package: String, at version: Version) throws {
+        let container = try XCTUnwrap(self.containers[package])
+        container.unusedDependencyTraitRequests[BoundVersion.version(version).description, default: []].append(
+            PackageContainerConstraint(
+                package: try reference(for: dependency),
+                requirement: .versionSet(.any),
+                products: .nothing,
+                enabledTraits: EnabledTraits(traits, setBy: .package(.init(stringLiteral: package)))
+            )
+        )
     }
 
     /// Creates a `Package.resolved` store with the given resolution results.
@@ -3974,5 +4001,26 @@ extension Result where Success == [DependencyResolverBinding] {
             XCTFail("Unexpected result \(self)")
         }
         return nil
+    }
+}
+
+extension PubGrubTests {
+    /// A version that resolution rejects must not leave behind the traits it requested on unused dependencies.
+    func testTraitRequestOfRejectedVersionDoesNotApply() async throws {
+        try builder.serve("a", at: v1)
+        try builder.serve("a", at: v1_1, with: ["a": ["x": (.versionSet(.exact(v2)), .specific(["x"]))]])
+        try builder.requestTraits(["T"], on: "b", from: "a", at: v1_1)
+        try builder.serve("b", at: v1, with: ["b+T": ["x": (.versionSet(.exact(v2)), .specific(["x"]))]])
+        try builder.serve("x", at: v1)
+        try builder.serve("x", at: v2)
+
+        let resolver = builder.create()
+        let result = await resolver.solve(constraints: try builder.create(dependencies: [
+            "a": (.versionSet(v1Range), .specific(["a"])),
+            "b": (.versionSet(.exact(v1)), .specific(["b"])),
+            "x": (.versionSet(.exact(v1)), .specific(["x"])),
+        ]))
+
+        AssertResult(result, [("a", .version(v1)), ("b", .version(v1)), ("x", .version(v1))])
     }
 }

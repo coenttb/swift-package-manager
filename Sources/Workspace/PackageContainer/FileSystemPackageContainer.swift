@@ -99,6 +99,14 @@ public struct FileSystemPackageContainer: PackageContainer {
         return try manifest.dependencyConstraints(productFilter: productFilter, enabledTraits)
     }
 
+    public func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) async throws -> [PackageContainerConstraint] {
+        try await self.loadManifest().traitRequestsOfUnusedDependencies(productFilter: productFilter, enabledTraits)
+    }
+
     public func loadPackageReference(at boundVersion: BoundVersion) async throws -> PackageReference {
         assert(boundVersion == .unversioned, "Unexpected bound version \(boundVersion)")
         let manifest = try await loadManifest()

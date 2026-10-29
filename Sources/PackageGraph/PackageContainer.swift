@@ -101,6 +101,15 @@ public protocol PackageContainer {
     /// Get the updated set of traits at a bound version.
     ///
     func loadPackageTraits(at boundVersion: BoundVersion) async throws -> Set<TraitDescription>
+
+    /// The traits this package requests, at a bound version, on dependencies that none of the products
+    /// in `productFilter` uses. Resolution does not follow these dependencies, but their traits still apply
+    /// to the dependency wherever else the graph reaches it.
+    func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) async throws -> [PackageContainerConstraint]
 }
 
 extension PackageContainer {
@@ -117,6 +126,14 @@ extension PackageContainer {
     }
 
     func getDependencies(at revision: String, productFilter: ProductFilter, _ enabledTraits: Set<String> = ["default"]) async throws -> [PackageContainerConstraint] {
+        return []
+    }
+
+    public func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) async throws -> [PackageContainerConstraint] {
         return []
     }
 }

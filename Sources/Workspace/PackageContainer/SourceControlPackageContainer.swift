@@ -369,6 +369,24 @@ internal final class SourceControlPackageContainer: PackageContainer, CustomStri
         return .init(manifest: manifest, constraints: try manifest.dependencyConstraints(productFilter: productFilter, enabledTraits), enabledTraits: enabledTraits)
     }
 
+    public func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) async throws -> [Constraint] {
+        let manifest: Manifest
+        switch boundVersion {
+        case .version(let version):
+            guard let tag = try await self.knownVersions()[version] else { return [] }
+            manifest = try await self.loadManifest(tag: tag, version: version)
+        case .revision(let revision, _):
+            manifest = try await self.loadManifest(at: repository.resolveRevision(identifier: revision), version: nil)
+        case .unversioned, .excluded:
+            return []
+        }
+        return try manifest.traitRequestsOfUnusedDependencies(productFilter: productFilter, enabledTraits)
+    }
+
     public func getUnversionedDependencies(productFilter: ProductFilter, _ enabledTraits: EnabledTraits = ["default"]) throws -> [Constraint] {
         // We just return an empty array if requested for unversioned dependencies.
         return []

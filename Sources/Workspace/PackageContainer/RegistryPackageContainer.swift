@@ -116,6 +116,16 @@ public class RegistryPackageContainer: PackageContainer {
         return try manifest.dependencyConstraints(productFilter: productFilter, enabledTraits)
     }
 
+    public func getTraitRequestsOfUnusedDependencies(
+        at boundVersion: BoundVersion,
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits
+    ) async throws -> [PackageContainerConstraint] {
+        guard case .version(let version) = boundVersion else { return [] }
+        return try await self.loadManifest(version: version)
+            .traitRequestsOfUnusedDependencies(productFilter: productFilter, enabledTraits)
+    }
+
     public func getDependencies(at revision: String, productFilter: ProductFilter, _ enabledTraits: EnabledTraits = ["default"]) throws -> [PackageContainerConstraint] {
         throw InternalError("getDependencies for revision not supported by RegistryPackageContainer")
     }

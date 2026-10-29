@@ -39,7 +39,24 @@ extension Manifest {
         productFilter: ProductFilter,
         _ enabledTraits: EnabledTraits = ["default"]
     ) throws -> [PackageContainerConstraint] {
-        return try self.dependenciesRequired(for: productFilter, enabledTraits).map({ dependency in
+        try self.constraints(for: self.dependenciesRequired(for: productFilter, enabledTraits), enabledTraits)
+    }
+
+    /// Constructs the trait requests on the dependencies that `dependencyConstraints` leaves out.
+    public func traitRequestsOfUnusedDependencies(
+        productFilter: ProductFilter,
+        _ enabledTraits: EnabledTraits = ["default"]
+    ) throws -> [PackageContainerConstraint] {
+        let required = try Set(self.dependenciesRequired(for: productFilter, enabledTraits).map(\.identity))
+        let unused = self.dependencies.filter { !required.contains($0.identity) }
+        return try self.constraints(for: unused, enabledTraits)
+    }
+
+    private func constraints(
+        for dependencies: [PackageDependency],
+        _ enabledTraits: EnabledTraits
+    ) throws -> [PackageContainerConstraint] {
+        return try dependencies.map({ dependency in
             let setter: EnabledTrait.Setter = .package(.init(identity: self.packageIdentity, name: self.displayName))
             let enabledTraitsSet: EnabledTraits
             if let dependencyTraits = dependency.traits {

@@ -13,6 +13,8 @@
 import _InternalTestSupport
 import Basics
 import PackageModel
+import SourceControl
+import Workspace
 import XCTest
 import Testing
 
@@ -2873,6 +2875,389 @@ extension WorkspaceTests {
         try await workspace.checkPackageGraph(roots: ["Root"], deps: []) { graph, _ in
             let traitlessPackage = graph.packages.first { $0.identity == .plain("traitlesspackage") }
             XCTAssertEqual(traitlessPackage?.enabledTraits, ["default"])
+        }
+    }
+
+    /// A package that requests a trait on a dependency none of its products use: `TraitTests`'s
+    /// `traits_whenTraitUnification_whenSecondTraitNotEnabled` expects such a request to apply wherever the graph
+    /// reaches that dependency.
+    private func unusedTraitRequestWorkspace(
+        rootDependencies: [MockDependency] = [],
+        extraPackages: [MockPackage] = [],
+        binaryArtifactsManager: Workspace.CustomBinaryArtifactsManager? = nil,
+        fileSystem fs: InMemoryFileSystem = InMemoryFileSystem()
+    ) async throws -> MockWorkspace {
+        try await MockWorkspace(
+            sandbox: AbsolutePath("/tmp/ws/"),
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "Shared"),
+                                .product(name: "ParentProduct", package: "Parent"),
+                            ] + extraPackages.map { .product(name: "\($0.name)Product", package: $0.name) }
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./Parent", requirement: .upToNextMajor(from: "1.0.0")),
+                    ] + rootDependencies
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "Parent",
+                    targets: [MockTarget(name: "ParentTarget")],
+                    products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                    dependencies: [
+                        .sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"), traits: ["Trait"]),
+                        .sourceControl(path: "./Lonely", requirement: .upToNextMajor(from: "1.0.0"), traits: ["Trait"]),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Shared",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                        )
+                    ],
+                    products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                    dependencies: [.sourceControl(path: "./Guarded", requirement: .upToNextMajor(from: "1.0.0"))],
+                    traits: ["Trait"],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Guarded",
+                    targets: [MockTarget(name: "GuardedTarget")],
+                    products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Lonely",
+                    targets: [MockTarget(name: "LonelyTarget")],
+                    products: [MockProduct(name: "LonelyProduct", modules: ["LonelyTarget"])],
+                    traits: ["Trait"],
+                    versions: ["1.0.0"]
+                ),
+            ] + extraPackages,
+            binaryArtifactsManager: binaryArtifactsManager
+        )
+    }
+
+    /// The request enables the trait, so the dependency it guards is resolved. It adds no package: `Lonely`, which
+    /// only the unused edge names, is not resolved, and resolving again leaves `Package.resolved` as it was.
+    func testTraitRequestedOnUnusedDependencyResolvesItsGuardedDependency() async throws {
+        let workspace = try await self.unusedTraitRequestWorkspace()
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(packages: "Root", "Parent", "Shared", "Guarded")
+            }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+        let resolved = try workspace.getOrCreateWorkspace().resolvedPackagesStore.load().resolvedPackages
+        XCTAssertEqual(Set(resolved.keys.map(\.description)), ["parent", "shared", "guarded"])
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { _, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+        let resolvedAgain = try workspace.getOrCreateWorkspace().resolvedPackagesStore.load().resolvedPackages
+        XCTAssertEqual(resolvedAgain.mapValues(\.state), resolved.mapValues(\.state))
+    }
+
+    /// A trait that 1.0 enables by default and 1.1 does not must not keep its guarded dependency when updating to 1.1.
+    func testUpdateDropsDependencyOfTraitNoLongerEnabledByDefault() async throws {
+        for packages in [[], ["shared"]] {
+            let workspace = try await MockWorkspace(
+                sandbox: AbsolutePath("/tmp/ws/"),
+                fileSystem: InMemoryFileSystem(),
+                roots: [
+                    MockPackage(
+                        name: "Root",
+                        targets: [MockTarget(name: "RootTarget", dependencies: [.product(name: "SharedProduct", package: "Shared")])],
+                        dependencies: [.sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"))]
+                    )
+                ],
+                packages: [
+                    MockPackage(
+                        name: "Shared",
+                        targets: [
+                            MockTarget(
+                                name: "SharedTarget",
+                                dependencies: [.product(name: "OldProduct", package: "Old", condition: .init(traits: ["OldFeature"]))]
+                            )
+                        ],
+                        products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                        dependencies: [.sourceControl(path: "./Old", requirement: .upToNextMajor(from: "1.0.0"))],
+                        traitsPerVersion: [
+                            "1.0.0": [.init(name: "default", enabledTraits: ["OldFeature"]), "OldFeature"],
+                            "1.1.0": [.init(name: "default", enabledTraits: []), "OldFeature"],
+                        ],
+                        versions: ["1.0.0", "1.1.0"],
+                        revisionProvider: { $0 }
+                    ),
+                    MockPackage(
+                        name: "Old",
+                        targets: [MockTarget(name: "OldTarget")],
+                        products: [MockProduct(name: "OldProduct", modules: ["OldTarget"])],
+                        versions: ["1.0.0"]
+                    ),
+                ]
+            )
+            let deps: [MockDependency] = [.sourceControl(path: "./Shared", requirement: .exact("1.0.0"))]
+            try await workspace.checkPackageGraph(roots: ["Root"], deps: deps) { graph, diagnostics in
+                PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Shared", "Old") }
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+
+            try await workspace.checkUpdate(roots: ["Root"], packages: packages) { diagnostics in
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+            try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+                PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Shared") }
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+            await workspace.checkManagedDependencies { result in
+                result.check(dependency: "shared", at: .checkout(.version("1.1.0")))
+                result.check(notPresent: "old")
+            }
+            workspace.checkResolved { result in
+                result.check(notPresent: "old")
+            }
+        }
+    }
+
+    /// Updating a package whose binary artifact changes checksum stays allowed when the update also resolves a
+    /// dependency enabled through a trait request on an unused dependency.
+    func testUpdateWithChangedArtifactChecksumAndUnusedTraitRequest() async throws {
+        let fs = InMemoryFileSystem()
+        let httpClient = HTTPClient { request, _ in
+            guard case .download(let fileSystem, let destination) = request.kind else {
+                throw StringError("invalid request \(request.kind)")
+            }
+            try fileSystem.writeFileContents(destination, bytes: [0xA1], atomically: true)
+            return .okay()
+        }
+        let archiver = MockArchiver(handler: { archiver, archivePath, destinationPath, completion in
+            do {
+                try createDummyXCFramework(fileSystem: fs, path: destinationPath, name: "Binary")
+                archiver.extractions.append(MockArchiver.Extraction(archivePath: archivePath, destinationPath: destinationPath))
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        })
+        let binary = MockPackage(
+            name: "WithBinary",
+            targets: [try MockTarget(name: "Binary", type: .binary, url: "https://a.com/binary.zip", checksum: "a1")],
+            products: [MockProduct(name: "WithBinaryProduct", modules: ["Binary"])],
+            versions: ["1.0.0", "1.1.0"],
+            revisionProvider: { $0 }
+        )
+        let workspace = try await self.unusedTraitRequestWorkspace(
+            rootDependencies: [.sourceControl(path: "./WithBinary", requirement: .upToNextMajor(from: "1.0.0"))],
+            extraPackages: [binary],
+            binaryArtifactsManager: .init(httpClient: httpClient, archiver: archiver),
+            fileSystem: fs
+        )
+        let binaryPath = try workspace.pathToPackage(withName: "WithBinary")
+        let binaryRef = PackageReference.localSourceControl(identity: PackageIdentity(path: binaryPath), path: binaryPath)
+        let deps: [MockDependency] = [.sourceControl(path: "./WithBinary", requirement: .exact("1.0.0"))]
+        try await workspace.checkPackageGraph(roots: ["Root"], deps: deps) { _, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+        try await workspace.set(
+            managedArtifacts: [
+                .init(
+                    packageRef: binaryRef,
+                    targetName: "Binary",
+                    source: .remote(url: "https://a.com/binary.zip", checksum: "a0"),
+                    path: workspace.artifactsDir.appending(components: "withbinary", "Binary.xcframework"),
+                    kind: .xcframework
+                ),
+            ]
+        )
+
+        try await workspace.checkUpdate(roots: ["Root"]) { diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+        await workspace.checkManagedDependencies { result in
+            result.check(dependency: "withbinary", at: .checkout(.version("1.1.0")))
+            result.check(dependency: "guarded", at: .checkout(.version("1.0.0")))
+        }
+    }
+
+    /// The same request between local packages, in either order, so that it also reaches a package already expanded.
+    func testTraitRequestedOnUnusedLocalDependencyResolvesItsGuardedDependency() async throws {
+        for order in [["Shared", "Parent"], ["Parent", "Shared"]] {
+            let workspace = try await MockWorkspace(
+                sandbox: AbsolutePath("/tmp/ws/"),
+                fileSystem: InMemoryFileSystem(),
+                roots: [
+                    MockPackage(
+                        name: "Root",
+                        targets: [try MockTarget(name: "RootTarget", dependencies: order.map { .product(name: "\($0)Product", package: $0) })],
+                        dependencies: order.map { .fileSystem(path: "./\($0)") }
+                    )
+                ],
+                packages: [
+                    MockPackage(
+                        name: "Parent",
+                        targets: [MockTarget(name: "ParentTarget")],
+                        products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                        dependencies: [.fileSystem(path: "./Shared", traits: ["Trait"])],
+                        versions: [nil]
+                    ),
+                    MockPackage(
+                        name: "Shared",
+                        targets: [
+                            MockTarget(
+                                name: "SharedTarget",
+                                dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                            )
+                        ],
+                        products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                        dependencies: [.fileSystem(path: "./Guarded")],
+                        traits: ["Trait"],
+                        versions: [nil]
+                    ),
+                    MockPackage(
+                        name: "Guarded",
+                        targets: [MockTarget(name: "GuardedTarget")],
+                        products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                        versions: [nil]
+                    ),
+                ]
+            )
+
+            try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+                PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Parent", "Shared", "Guarded") }
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+        }
+    }
+
+    /// A branch-based package requests a trait on a local package that was expanded before it.
+    func testBranchPackageRequestsTraitOnUnusedLocalDependency() async throws {
+        let workspace = try await MockWorkspace(
+            sandbox: AbsolutePath("/tmp/ws/"),
+            fileSystem: InMemoryFileSystem(),
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "Shared"),
+                                .product(name: "ParentProduct", package: "Parent"),
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "./Shared"),
+                        .sourceControl(path: "./Parent", requirement: .branch("main")),
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "Parent",
+                    targets: [MockTarget(name: "ParentTarget")],
+                    products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                    dependencies: [.sourceControl(path: "./Shared", requirement: .branch("main"), traits: ["Trait"])],
+                    versions: ["main"]
+                ),
+                MockPackage(
+                    name: "Shared",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                        )
+                    ],
+                    products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                    dependencies: [.fileSystem(path: "./Guarded")],
+                    traits: ["Trait"],
+                    versions: [nil, "main"]
+                ),
+                MockPackage(
+                    name: "Guarded",
+                    targets: [MockTarget(name: "GuardedTarget")],
+                    products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                    versions: [nil]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Parent", "Shared", "Guarded") }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+    }
+
+    /// A dependency declared without traits requests its defaults, even when nothing uses it.
+    func testUnusedDependencyWithoutTraitsRequestsDefaults() async throws {
+        let workspace = try await MockWorkspace(
+            sandbox: AbsolutePath("/tmp/ws/"),
+            fileSystem: InMemoryFileSystem(),
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "Shared"),
+                                .product(name: "ParentProduct", package: "Parent"),
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"), traits: ["Other"]),
+                        .sourceControl(path: "./Parent", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "Parent",
+                    targets: [MockTarget(name: "ParentTarget")],
+                    products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                    dependencies: [.sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"))],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Shared",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                        )
+                    ],
+                    products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                    dependencies: [.sourceControl(path: "./Guarded", requirement: .upToNextMajor(from: "1.0.0"))],
+                    traits: [.init(name: "default", enabledTraits: ["Trait"]), "Trait", "Other"],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Guarded",
+                    targets: [MockTarget(name: "GuardedTarget")],
+                    products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Parent", "Shared", "Guarded") }
+            XCTAssertNoDiagnostics(diagnostics)
         }
     }
 }

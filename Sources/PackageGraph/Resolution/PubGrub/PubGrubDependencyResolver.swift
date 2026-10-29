@@ -112,6 +112,21 @@ public struct PubGrubDependencyResolver {
             }
         }
 
+        /// Records traits that a package requests on a dependency it does not use. Unlike an incompatibility,
+        /// a request adds no dependency: it only enables traits on a package the graph reaches anyway.
+        func addTraitRequests(_ requests: [Constraint]) {
+            self.lock.withLock {
+                for request in requests {
+                    let identity = request.package.identity
+                    let previous = self.resolutionTraits(for: identity)
+                    self.enabledTraitsMap[identity] = request.enabledTraits
+                    if !self.resolutionTraits(for: identity).isSubset(of: previous) {
+                        self.decisionsToRepair.formUnion(self.solution.decisions(for: identity))
+                    }
+                }
+            }
+        }
+
         /// Find all incompatibilities containing a positive term for a given package.
         func positiveIncompatibilities(for node: DependencyResolutionNode) -> [Incompatibility]? {
             self.lock.withLock {
@@ -298,6 +313,7 @@ public struct PubGrubDependencyResolver {
         }
 
         let state = State(root: root, overriddenPackages: inputs.overriddenPackages)
+        state.addTraitRequests(inputs.traitRequests)
 
         // Decide root at v1.
         state.decide(state.root, at: "1.0.0")
@@ -390,7 +406,8 @@ public struct PubGrubDependencyResolver {
         with constraints: [Constraint]
     ) async throws -> (
         overriddenPackages: [PackageReference: (version: BoundVersion, products: ProductFilter)],
-        rootIncompatibilities: [Incompatibility]
+        rootIncompatibilities: [Incompatibility],
+        traitRequests: [Constraint]
     ) {
         // The list of constraints that we'll be working with. We start with the input constraints
         // and process them in two phases. The first phase finds all unversioned constraints and
@@ -407,137 +424,173 @@ public struct PubGrubDependencyResolver {
         // Some of these might be overridden as we discover local and branch-based references.
         var versionBasedDependencies = OrderedCollections.OrderedDictionary<DependencyResolutionNode, [VersionBasedConstraint]>()
 
-        // Process unversioned constraints in first phase. We go through all of the unversioned packages
-        // and collect them and their dependencies. This gives us the complete list of unversioned
-        // packages in the graph since unversioned packages can only be referred by other
-        // unversioned packages.
-        while let constraint = constraints.first(where: { $0.requirement == .unversioned }) {
-            constraints.remove(constraint)
-
-            // Mark the package as overridden.
-            if var existing = overriddenPackages[constraint.package] {
-                guard existing.version == .unversioned else {
-                    throw InternalError("Overridden package is not unversioned: \(constraint.package)@\(existing.version)")
+        // Trait requests on dependencies that the packages expanded here do not use. They apply to the packages
+        // PubGrub decides, and, if they arrive first, to the unversioned and branch-based packages expanded here.
+        var traitRequests: [Constraint] = []
+        var requestedTraits: [PackageReference: EnabledTraits] = [:]
+        func traits(for node: DependencyResolutionNode) -> EnabledTraits {
+            requestedTraits[node.package].map { node.enabledTraits.union($0) } ?? node.enabledTraits
+        }
+        func addTraitRequests(of container: PubGrubPackageContainer, at boundVersion: BoundVersion, node: DependencyResolutionNode) async throws {
+            for request in try await container.underlying.getTraitRequestsOfUnusedDependencies(
+                at: boundVersion,
+                productFilter: node.productFilter,
+                traits(for: node)
+            ) {
+                traitRequests.append(request)
+                if let requested = requestedTraits[request.package], request.enabledTraits.isSubset(of: requested) { continue }
+                requestedTraits[request.package] = requestedTraits[request.package].map { $0.union(request.enabledTraits) }
+                    ?? request.enabledTraits
+                // A package that was already expanded is queued again, for no products, to be expanded with the new
+                // traits. Requested traits only grow, so this ends.
+                let requirement: PackageRequirement? = switch overriddenPackages[request.package]?.version {
+                case .unversioned: .unversioned
+                case .revision(let revision, let branch): .revision(branch ?? revision)
+                default: nil
                 }
-                existing.products.formUnion(constraint.products)
-                overriddenPackages[constraint.package] = existing
-            } else {
-                overriddenPackages[constraint.package] = (version: .unversioned, products: constraint.products)
-            }
-
-            for node in constraint.nodes() {
-                // Process dependencies of this package.
-                //
-                // We collect all version-based dependencies in a separate structure so they can
-                // be process at the end. This allows us to override them when there is a non-version
-                // based (unversioned/branch-based) constraint present in the graph.
-                let container = try await withCheckedThrowingContinuation { continuation in
-                    self.provider.getContainer(
-                        for: node.package,
-                        completion: {
-                            continuation.resume(with: $0)
-                        }
-                    )
-                }
-
-                for dependency in try await container.underlying
-                    .getUnversionedDependencies(productFilter: node.productFilter, node.enabledTraits)
-                {
-                    if let versionedBasedConstraints = VersionBasedConstraint.constraints(dependency) {
-                        for constraint in versionedBasedConstraints {
-                            versionBasedDependencies[node, default: []].append(constraint)
-                        }
-                    } else if !overriddenPackages.keys.contains(dependency.package) {
-                        // Add the constraint if its not already present. This will ensure we don't
-                        // end up looping infinitely due to a cycle (which are diagnosed separately).
-                        constraints.append(dependency)
-                    }
+                if let requirement {
+                    constraints.append(Constraint(package: request.package, requirement: requirement, products: .nothing, enabledTraits: request.enabledTraits))
                 }
             }
         }
 
-        // Process revision-based constraints in the second phase. Here we do the similar processing
-        // as the first phase but we also ignore the constraints that are overridden due to
-        // presence of unversioned constraints.
-        while let constraint = constraints.first(where: { $0.requirement.isRevision }) {
-            guard case .revision(let revision) = constraint.requirement else {
-                throw InternalError("Expected revision requirement")
-            }
-            constraints.remove(constraint)
-            let package = constraint.package
-
-            // Check if there is an existing value for this package in the overridden packages.
-            switch overriddenPackages[package]?.version {
-            case .excluded?, .version?:
-                // These values are not possible.
-                throw InternalError("Unexpected value for overridden package \(package) in \(overriddenPackages)")
-            case .unversioned?:
-                // This package is overridden by an unversioned package so we can ignore this constraint.
-                continue
-            case .revision(let existingRevision, let branch)?:
-                // If this branch-based package was encountered before, ensure the references match.
-                if (branch ?? existingRevision) != revision {
-                    throw PubGrubError.unresolvable("\(package.identity) is required using two different revision-based requirements (\(existingRevision) and \(revision)), which is not supported")
-                } else {
-                    // Otherwise, continue since we've already processed this constraint. Any cycles will be diagnosed separately.
-                    continue
-                }
-            case nil:
-                break
-            }
-
-            // Process dependencies of this package, similar to the first phase but branch-based dependencies
-            // are not allowed to contain local/unversioned packages.
-            let container = try await withCheckedThrowingContinuation { continuation in
-                self.provider.getContainer(for: package, completion: {
-                    continuation.resume(with: $0)
-                })
-            }
-
-            // If there is a pin for this revision-based dependency, get
-            // the dependencies at the pinned revision instead of using
-            // latest commit on that branch. Note that if this revision-based dependency is
-            // already a commit, then its pin entry doesn't matter in practice.
-            let revisionForDependencies: String
-            if case .branch(revision, let pinRevision) = self.resolvedPackages[package.identity]?.state {
-                revisionForDependencies = pinRevision
-
-                // Mark the package as overridden with the pinned revision and record the branch as well.
-                overriddenPackages[package] = (version: .revision(revisionForDependencies, branch: revision), products: constraint.products)
-            } else {
-                revisionForDependencies = revision
+        // A trait request from a branch-based package can queue an unversioned package again, so the two
+        // phases repeat until neither has work left.
+        repeat {
+            // Process unversioned constraints in first phase. We go through all of the unversioned packages
+            // and collect them and their dependencies. This gives us the complete list of unversioned
+            // packages in the graph since unversioned packages can only be referred by other
+            // unversioned packages.
+            while let constraint = constraints.first(where: { $0.requirement == .unversioned }) {
+                constraints.remove(constraint)
 
                 // Mark the package as overridden.
-                overriddenPackages[package] = (version: .revision(revision), products: constraint.products)
+                if var existing = overriddenPackages[constraint.package] {
+                    guard existing.version == .unversioned else {
+                        throw InternalError("Overridden package is not unversioned: \(constraint.package)@\(existing.version)")
+                    }
+                    existing.products.formUnion(constraint.products)
+                    overriddenPackages[constraint.package] = existing
+                } else {
+                    overriddenPackages[constraint.package] = (version: .unversioned, products: constraint.products)
+                }
+
+                for node in constraint.nodes() {
+                    // Process dependencies of this package.
+                    //
+                    // We collect all version-based dependencies in a separate structure so they can
+                    // be process at the end. This allows us to override them when there is a non-version
+                    // based (unversioned/branch-based) constraint present in the graph.
+                    let container = try await withCheckedThrowingContinuation { continuation in
+                        self.provider.getContainer(
+                            for: node.package,
+                            completion: {
+                                continuation.resume(with: $0)
+                            }
+                        )
+                    }
+
+                    for dependency in try await container.underlying
+                        .getUnversionedDependencies(productFilter: node.productFilter, traits(for: node))
+                    {
+                        if let versionedBasedConstraints = VersionBasedConstraint.constraints(dependency) {
+                            for constraint in versionedBasedConstraints {
+                                versionBasedDependencies[node, default: []].append(constraint)
+                            }
+                        } else if !overriddenPackages.keys.contains(dependency.package) {
+                            // Add the constraint if its not already present. This will ensure we don't
+                            // end up looping infinitely due to a cycle (which are diagnosed separately).
+                            constraints.append(dependency)
+                        }
+                    }
+                    try await addTraitRequests(of: container, at: .unversioned, node: node)
+                }
             }
 
-            for node in constraint.nodes() {
-                var unprocessedDependencies = try await container.underlying.getDependencies(
-                    at: revisionForDependencies,
-                    productFilter: constraint.products,
-                    node.enabledTraits
-                )
-                if let sharedRevision = node.revisionLock(revision: revision) {
-                    unprocessedDependencies.append(sharedRevision)
+            // Process revision-based constraints in the second phase. Here we do the similar processing
+            // as the first phase but we also ignore the constraints that are overridden due to
+            // presence of unversioned constraints.
+            while let constraint = constraints.first(where: { $0.requirement.isRevision }) {
+                guard case .revision(let revision) = constraint.requirement else {
+                    throw InternalError("Expected revision requirement")
                 }
-                for dependency in unprocessedDependencies {
-                    switch dependency.requirement {
-                    case .versionSet(let req):
-                        for node in dependency.nodes() {
-                            let versionedBasedConstraint = VersionBasedConstraint(node: node, req: req)
-                            versionBasedDependencies[.root(package: constraint.package), default: []].append(versionedBasedConstraint)
+                constraints.remove(constraint)
+                let package = constraint.package
+
+                // Check if there is an existing value for this package in the overridden packages.
+                switch overriddenPackages[package]?.version {
+                case .excluded?, .version?:
+                    // These values are not possible.
+                    throw InternalError("Unexpected value for overridden package \(package) in \(overriddenPackages)")
+                case .unversioned?:
+                    // This package is overridden by an unversioned package so we can ignore this constraint.
+                    continue
+                case .revision(let existingRevision, let branch)?:
+                    // If this branch-based package was encountered before, ensure the references match.
+                    if (branch ?? existingRevision) != revision {
+                        throw PubGrubError.unresolvable("\(package.identity) is required using two different revision-based requirements (\(existingRevision) and \(revision)), which is not supported")
+                    } else {
+                        // Otherwise, continue since we've already processed this constraint. Any cycles will be diagnosed separately.
+                        continue
+                    }
+                case nil:
+                    break
+                }
+
+                // Process dependencies of this package, similar to the first phase but branch-based dependencies
+                // are not allowed to contain local/unversioned packages.
+                let container = try await withCheckedThrowingContinuation { continuation in
+                    self.provider.getContainer(for: package, completion: {
+                        continuation.resume(with: $0)
+                    })
+                }
+
+                // If there is a pin for this revision-based dependency, get
+                // the dependencies at the pinned revision instead of using
+                // latest commit on that branch. Note that if this revision-based dependency is
+                // already a commit, then its pin entry doesn't matter in practice.
+                let revisionForDependencies: String
+                if case .branch(revision, let pinRevision) = self.resolvedPackages[package.identity]?.state {
+                    revisionForDependencies = pinRevision
+
+                    // Mark the package as overridden with the pinned revision and record the branch as well.
+                    overriddenPackages[package] = (version: .revision(revisionForDependencies, branch: revision), products: constraint.products)
+                } else {
+                    revisionForDependencies = revision
+
+                    // Mark the package as overridden.
+                    overriddenPackages[package] = (version: .revision(revision), products: constraint.products)
+                }
+
+                for node in constraint.nodes() {
+                    var unprocessedDependencies = try await container.underlying.getDependencies(
+                        at: revisionForDependencies,
+                        productFilter: constraint.products,
+                        traits(for: node)
+                    )
+                    try await addTraitRequests(of: container, at: .revision(revisionForDependencies), node: node)
+                    if let sharedRevision = node.revisionLock(revision: revision) {
+                        unprocessedDependencies.append(sharedRevision)
+                    }
+                    for dependency in unprocessedDependencies {
+                        switch dependency.requirement {
+                        case .versionSet(let req):
+                            for node in dependency.nodes() {
+                                let versionedBasedConstraint = VersionBasedConstraint(node: node, req: req)
+                                versionBasedDependencies[.root(package: constraint.package), default: []].append(versionedBasedConstraint)
+                            }
+                        case .revision:
+                            constraints.append(dependency)
+                        case .unversioned:
+                            throw DependencyResolverError.revisionDependencyContainsLocalPackage(
+                                dependency: package.identity.description,
+                                localPackage: dependency.package.identity.description
+                            )
                         }
-                    case .revision:
-                        constraints.append(dependency)
-                    case .unversioned:
-                        throw DependencyResolverError.revisionDependencyContainsLocalPackage(
-                            dependency: package.identity.description,
-                            localPackage: dependency.package.identity.description
-                        )
                     }
                 }
             }
-        }
+        } while constraints.contains(where: { $0.requirement == .unversioned || $0.requirement.isRevision })
 
         // At this point, we should be left with only version-based requirements in our constraints
         // list. Add them to our version-based dependency list.
@@ -569,7 +622,7 @@ public struct PubGrubDependencyResolver {
             }
         }
 
-        return (overriddenPackages, rootIncompatibilities)
+        return (overriddenPackages, rootIncompatibilities, traitRequests)
     }
 
     /// Perform unit propagation, resolving conflicts if necessary and making
@@ -601,12 +654,28 @@ public struct PubGrubDependencyResolver {
                 for incompatibility in incompatibilities {
                     state.addIncompatibility(incompatibility, at: .decisionMaking)
                 }
+                try await self.addTraitRequestsOfUnusedDependencies(of: repairNode, at: version, in: container, state: state)
             } else {
                 // If decision making determines that no more decisions are to be
                 // made, it returns nil to signal that version solving is done.
                 next = try await self.makeDecision(state: state)
             }
         }
+    }
+
+    private func addTraitRequestsOfUnusedDependencies(
+        of node: DependencyResolutionNode,
+        at version: Version,
+        in container: PubGrubPackageContainer,
+        state: State
+    ) async throws {
+        // A version with an incompatible tools version has no dependencies to read.
+        guard await container.underlying.isToolsVersionCompatible(at: version) else { return }
+        state.addTraitRequests(try await container.underlying.getTraitRequestsOfUnusedDependencies(
+            at: .version(version),
+            productFilter: node.productFilter,
+            state.enabledTraits(for: node)
+        ))
     }
 
     /// Perform unit propagation to derive new assignments based on the current
@@ -868,6 +937,7 @@ public struct PubGrubDependencyResolver {
         if !haveConflict {
             self.delegate?.didResolve(term: pkgTerm, version: version, duration: start.distance(to: .now()))
             state.decide(pkgTerm.node, at: version)
+            try await self.addTraitRequestsOfUnusedDependencies(of: pkgTerm.node, at: version, in: container, state: state)
         }
 
         return pkgTerm.node
