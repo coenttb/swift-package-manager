@@ -445,7 +445,7 @@ extension Manifest {
     ) -> Bool {
         guard let condition = dependency.condition, let traits = condition.traits else { return false }
 
-        return enabledTraits.intersection(traits).isEmpty
+        return self.calculateAllEnabledTraits(explicitlyEnabledTraits: enabledTraits).intersection(traits).isEmpty
     }
 }
 

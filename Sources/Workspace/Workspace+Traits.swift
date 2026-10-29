@@ -22,6 +22,19 @@ import class Basics.ObservabilityScope
 import Basics
 
 extension Workspace {
+    /// The traits a package is loaded with: `named`, the traits its parents named, and its defaults if a parent
+    /// asked for them. A request for defaults is recorded apart from named traits, so a package whose traits were
+    /// computed before that request arrived would otherwise be loaded without its defaults.
+    func loadingTraits(_ named: EnabledTraits, for identity: PackageIdentity) -> EnabledTraits {
+        guard !named.contains("default"),
+              let defaultSetter = self.enabledTraitsMap[defaultSettersFor: identity]?.first
+        else {
+            return named
+        }
+
+        return named.union(EnabledTraits(["default"], setBy: defaultSetter))
+    }
+
     /// Given a loaded `Manifest`, determine the traits that are enabled for it and
     /// calculate whichever traits are enabled transitively from this, if possible, and update the
     /// map of enabled traits on `Workspace` (`Workspace.enabledTraitsMap`).

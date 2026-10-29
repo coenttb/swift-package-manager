@@ -647,7 +647,7 @@ extension Workspace {
                                 identity: dependency.identity,
                                 manifest: manifest,
                                 productFilter: dependency.productFilter,
-                                enabledTraits: self.enabledTraitsMap[dependency.identity]
+                                enabledTraits: self.loadingTraits(self.enabledTraitsMap[dependency.identity], for: dependency.identity)
                             ),
                             key: dependency.identity
                         ) :
@@ -665,7 +665,7 @@ extension Workspace {
                         identity: identity,
                         manifest: manifest,
                         productFilter: .everything,
-                        enabledTraits: self.enabledTraitsMap[manifest]
+                        enabledTraits: self.loadingTraits(self.enabledTraitsMap[manifest], for: identity)
                     ),
                     key: identity
                 )
