@@ -412,7 +412,53 @@ public struct PubGrubDependencyResolver {
         // The list of constraints that we'll be working with. We start with the input constraints
         // and process them in two phases. The first phase finds all unversioned constraints and
         // the second phase discovers all branch-based constraints.
-        var constraints = OrderedCollections.OrderedSet(constraints)
+        let inputs = constraints
+        var constraints = OrderedCollections.OrderedSet<Constraint>()
+
+        // Constraints compare equal regardless of traits, so a queued constraint takes on the traits of
+        // an equal one instead of dropping them.
+        func enqueue(_ constraint: Constraint) {
+            guard let index = constraints.firstIndex(of: constraint) else {
+                constraints.append(constraint)
+                return
+            }
+            let queued = constraints[index]
+            constraints.update(Constraint(
+                package: queued.package,
+                requirement: queued.requirement,
+                products: queued.products,
+                enabledTraits: queued.enabledTraits.union(constraint.enabledTraits)
+            ), at: index)
+        }
+        inputs.forEach(enqueue)
+
+        // A package is requested by every parent that depends on it, each with some products and traits. Its
+        // dependencies are expanded with the union of all of them, and again whenever a request adds to it.
+        var requested: [PackageReference: (products: ProductFilter, traits: EnabledTraits)] = [:]
+        var expanded: [PackageReference: (products: ProductFilter, traits: EnabledTraits)] = [:]
+        func covers(_ covering: (products: ProductFilter, traits: EnabledTraits)?, _ constraint: Constraint) -> Bool {
+            guard let covering else { return false }
+            return covering.products.union(constraint.products) == covering.products
+                && constraint.enabledTraits.isSubset(of: covering.traits)
+        }
+        /// Records `constraint`'s request, and returns the union to expand its package with, or `nil` if the
+        /// package was already expanded with everything requested.
+        func request(_ constraint: Constraint) -> Constraint? {
+            let union = requested[constraint.package].map {
+                (products: $0.products.union(constraint.products), traits: $0.traits.union(constraint.enabledTraits))
+            } ?? (products: constraint.products, traits: constraint.enabledTraits)
+            requested[constraint.package] = union
+            if let done = expanded[constraint.package], done.products == union.products, done.traits == union.traits {
+                return nil
+            }
+            expanded[constraint.package] = union
+            return Constraint(
+                package: constraint.package,
+                requirement: constraint.requirement,
+                products: union.products,
+                enabledTraits: union.traits
+            )
+        }
 
         // The list of packages that are overridden in the graph. A local package reference will
         // always override any other kind of package reference and branch-based reference will override
@@ -449,13 +495,13 @@ public struct PubGrubDependencyResolver {
                 default: nil
                 }
                 if let requirement {
-                    constraints.append(Constraint(package: request.package, requirement: requirement, products: .nothing, enabledTraits: request.enabledTraits))
+                    enqueue(Constraint(package: request.package, requirement: requirement, products: .nothing, enabledTraits: request.enabledTraits))
                 }
             }
         }
 
-        // A trait request from a branch-based package can queue an unversioned package again, so the two
-        // phases repeat until neither has work left.
+        // An unversioned package can be requested again by a branch-based package, for its products or for a
+        // trait request, so the two phases repeat until neither has work left.
         repeat {
             // Process unversioned constraints in first phase. We go through all of the unversioned packages
             // and collect them and their dependencies. This gives us the complete list of unversioned
@@ -474,6 +520,9 @@ public struct PubGrubDependencyResolver {
                 } else {
                     overriddenPackages[constraint.package] = (version: .unversioned, products: constraint.products)
                 }
+
+                guard let constraint = request(constraint) else { continue }
+                overriddenPackages[constraint.package]?.products = constraint.products
 
                 for node in constraint.nodes() {
                     // Process dependencies of this package.
@@ -497,10 +546,10 @@ public struct PubGrubDependencyResolver {
                             for constraint in versionedBasedConstraints {
                                 versionBasedDependencies[node, default: []].append(constraint)
                             }
-                        } else if !overriddenPackages.keys.contains(dependency.package) {
-                            // Add the constraint if its not already present. This will ensure we don't
-                            // end up looping infinitely due to a cycle (which are diagnosed separately).
-                            constraints.append(dependency)
+                        } else if !covers(expanded[dependency.package], dependency) {
+                            // Add the constraint unless its package was already expanded with everything it asks for.
+                            // Requests only grow, so a cycle (diagnosed separately) cannot loop infinitely.
+                            enqueue(dependency)
                         }
                     }
                     try await addTraitRequests(of: container, at: .unversioned, node: node)
@@ -523,14 +572,19 @@ public struct PubGrubDependencyResolver {
                     // These values are not possible.
                     throw InternalError("Unexpected value for overridden package \(package) in \(overriddenPackages)")
                 case .unversioned?:
-                    // This package is overridden by an unversioned package so we can ignore this constraint.
+                    // This package is overridden by an unversioned package. What this constraint asks for beyond
+                    // what that package was expanded with is requested of the unversioned package.
+                    if !covers(expanded[package], constraint) {
+                        enqueue(Constraint(package: package, requirement: .unversioned, products: constraint.products, enabledTraits: constraint.enabledTraits))
+                    }
                     continue
                 case .revision(let existingRevision, let branch)?:
                     // If this branch-based package was encountered before, ensure the references match.
                     if (branch ?? existingRevision) != revision {
                         throw PubGrubError.unresolvable("\(package.identity) is required using two different revision-based requirements (\(existingRevision) and \(revision)), which is not supported")
-                    } else {
-                        // Otherwise, continue since we've already processed this constraint. Any cycles will be diagnosed separately.
+                    } else if covers(expanded[package], constraint) {
+                        // Otherwise, continue if we've already processed everything it asks for. Any cycles will be
+                        // diagnosed separately.
                         continue
                     }
                 case nil:
@@ -562,6 +616,9 @@ public struct PubGrubDependencyResolver {
                     overriddenPackages[package] = (version: .revision(revision), products: constraint.products)
                 }
 
+                guard let constraint = request(constraint) else { continue }
+                overriddenPackages[package]?.products = constraint.products
+
                 for node in constraint.nodes() {
                     var unprocessedDependencies = try await container.underlying.getDependencies(
                         at: revisionForDependencies,
@@ -580,7 +637,7 @@ public struct PubGrubDependencyResolver {
                                 versionBasedDependencies[.root(package: constraint.package), default: []].append(versionedBasedConstraint)
                             }
                         case .revision:
-                            constraints.append(dependency)
+                            enqueue(dependency)
                         case .unversioned:
                             throw DependencyResolverError.revisionDependencyContainsLocalPackage(
                                 dependency: package.identity.description,
