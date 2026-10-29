@@ -56,11 +56,16 @@ public struct PubGrubDependencyResolver {
 
         private let lock = NSLock()
 
+        /// See `PubGrubDependencyResolver.knownEnabledTraits`.
+        let knownEnabledTraits: [PackageIdentity: EnabledTraits]
+
         init(root: DependencyResolutionNode,
              overriddenPackages: [PackageReference: (version: BoundVersion, products: ProductFilter)] = [:],
+             knownEnabledTraits: [PackageIdentity: EnabledTraits] = [:],
              solution: PartialSolution = PartialSolution())
         {
             self.root = root
+            self.knownEnabledTraits = knownEnabledTraits
             self.overriddenPackages = overriddenPackages
             self.solution = solution
         }
@@ -73,7 +78,10 @@ public struct PubGrubDependencyResolver {
         /// stays an unexpanded marker because expanding it needs the package's manifest. Callers
         /// must already hold `lock`.
         private func resolutionTraits(for identity: PackageIdentity) -> EnabledTraits {
-            let named = self.enabledTraitsMap[identity]
+            var named = self.enabledTraitsMap[identity]
+            if let known = self.knownEnabledTraits[identity] {
+                named = named.union(known)
+            }
             guard !named.contains("default"),
                   let defaultSetter = self.enabledTraitsMap[defaultSettersFor: identity]?.first
             else {
@@ -175,6 +183,11 @@ public struct PubGrubDependencyResolver {
     /// Resolver delegate
     private let delegate: DependencyResolverDelegate?
 
+    /// Traits already known to be enabled for each package, from every request in the manifests loaded
+    /// so far, including requests on dependencies that resolution does not follow. A package is always
+    /// resolved with at least these traits, so the dependencies they guard are resolved too.
+    private let knownEnabledTraits: [PackageIdentity: EnabledTraits]
+
     @available(*,
         deprecated,
         renamed: "init(provider:resolvedPackages:skipDependenciesUpdates:prefetchBasedOnResolvedFile:observabilityScope:delegate:)",
@@ -207,9 +220,11 @@ public struct PubGrubDependencyResolver {
         skipDependenciesUpdates: Bool = false,
         skipUpdateForResolvedPackages: Bool = false,
         prefetchBasedOnResolvedFile: Bool = false,
+        knownEnabledTraits: [PackageIdentity: EnabledTraits] = [:],
         observabilityScope: ObservabilityScope,
         delegate: DependencyResolverDelegate? = nil
     ) {
+        self.knownEnabledTraits = knownEnabledTraits
         self.packageContainerProvider = provider
         self.resolvedPackages = resolvedPackages
         self.prefetchPackages = prefetchPackages
@@ -297,7 +312,7 @@ public struct PubGrubDependencyResolver {
             self.provider.prefetch(containers: prefetchSet)
         }
 
-        let state = State(root: root, overriddenPackages: inputs.overriddenPackages)
+        let state = State(root: root, overriddenPackages: inputs.overriddenPackages, knownEnabledTraits: self.knownEnabledTraits)
 
         // Decide root at v1.
         state.decide(state.root, at: "1.0.0")
@@ -407,6 +422,51 @@ public struct PubGrubDependencyResolver {
         // Some of these might be overridden as we discover local and branch-based references.
         var versionBasedDependencies = OrderedCollections.OrderedDictionary<DependencyResolutionNode, [VersionBasedConstraint]>()
 
+        // The traits each unversioned or revision-based package's dependencies have been expanded with.
+        // A package can be requested again, by another parent, with traits the first request did not
+        // enable; its dependencies are then expanded again with the union, so that dependencies guarded
+        // by the new traits are not lost.
+        var expandedTraits: [PackageReference: EnabledTraits] = [:]
+
+        /// The traits to expand `constraint`'s package with, or `nil` if a previous expansion already
+        /// covered every trait it requests.
+        func traitsToExpand(_ constraint: Constraint) -> EnabledTraits? {
+            var requested = constraint.enabledTraits
+            if let known = self.knownEnabledTraits[constraint.package.identity] {
+                requested = requested.union(known)
+            }
+            guard let expanded = expandedTraits[constraint.package] else {
+                expandedTraits[constraint.package] = requested
+                return requested
+            }
+            guard !requested.isSubset(of: expanded) else {
+                return nil
+            }
+            let union = expanded.union(requested)
+            expandedTraits[constraint.package] = union
+            return union
+        }
+
+        /// Queues `dependency`. Constraints compare equal regardless of their traits, so a constraint
+        /// that is already queued for the same package takes on this one's traits as well.
+        func enqueue(_ dependency: Constraint) {
+            guard let index = constraints.firstIndex(of: dependency) else {
+                constraints.append(dependency)
+                return
+            }
+            let queued = constraints[index]
+            guard !dependency.enabledTraits.isSubset(of: queued.enabledTraits) else { return }
+            constraints.update(
+                Constraint(
+                    package: queued.package,
+                    requirement: queued.requirement,
+                    products: queued.products,
+                    enabledTraits: queued.enabledTraits.union(dependency.enabledTraits)
+                ),
+                at: index
+            )
+        }
+
         // Process unversioned constraints in first phase. We go through all of the unversioned packages
         // and collect them and their dependencies. This gives us the complete list of unversioned
         // packages in the graph since unversioned packages can only be referred by other
@@ -425,6 +485,8 @@ public struct PubGrubDependencyResolver {
                 overriddenPackages[constraint.package] = (version: .unversioned, products: constraint.products)
             }
 
+            guard let enabledTraits = traitsToExpand(constraint) else { continue }
+
             for node in constraint.nodes() {
                 // Process dependencies of this package.
                 //
@@ -441,16 +503,19 @@ public struct PubGrubDependencyResolver {
                 }
 
                 for dependency in try await container.underlying
-                    .getUnversionedDependencies(productFilter: node.productFilter, node.enabledTraits)
+                    .getUnversionedDependencies(productFilter: node.productFilter, enabledTraits)
                 {
                     if let versionedBasedConstraints = VersionBasedConstraint.constraints(dependency) {
                         for constraint in versionedBasedConstraints {
                             versionBasedDependencies[node, default: []].append(constraint)
                         }
-                    } else if !overriddenPackages.keys.contains(dependency.package) {
-                        // Add the constraint if its not already present. This will ensure we don't
-                        // end up looping infinitely due to a cycle (which are diagnosed separately).
-                        constraints.append(dependency)
+                    } else if !overriddenPackages.keys.contains(dependency.package)
+                        || expandedTraits[dependency.package].map({ !dependency.enabledTraits.isSubset(of: $0) }) ?? false
+                    {
+                        // Add the constraint if its package is not already processed, or if it requests
+                        // traits the package was not yet expanded with. Traits only ever grow, so this
+                        // still cannot loop infinitely on a cycle (which are diagnosed separately).
+                        enqueue(dependency)
                     }
                 }
             }
@@ -478,8 +543,9 @@ public struct PubGrubDependencyResolver {
                 // If this branch-based package was encountered before, ensure the references match.
                 if (branch ?? existingRevision) != revision {
                     throw PubGrubError.unresolvable("\(package.identity) is required using two different revision-based requirements (\(existingRevision) and \(revision)), which is not supported")
-                } else {
-                    // Otherwise, continue since we've already processed this constraint. Any cycles will be diagnosed separately.
+                } else if constraint.enabledTraits.isSubset(of: expandedTraits[package] ?? []) {
+                    // Otherwise, continue since we've already processed this constraint with these traits.
+                    // Any cycles will be diagnosed separately.
                     continue
                 }
             case nil:
@@ -511,11 +577,13 @@ public struct PubGrubDependencyResolver {
                 overriddenPackages[package] = (version: .revision(revision), products: constraint.products)
             }
 
+            guard let enabledTraits = traitsToExpand(constraint) else { continue }
+
             for node in constraint.nodes() {
                 var unprocessedDependencies = try await container.underlying.getDependencies(
                     at: revisionForDependencies,
                     productFilter: constraint.products,
-                    node.enabledTraits
+                    enabledTraits
                 )
                 if let sharedRevision = node.revisionLock(revision: revision) {
                     unprocessedDependencies.append(sharedRevision)
@@ -528,7 +596,7 @@ public struct PubGrubDependencyResolver {
                             versionBasedDependencies[.root(package: constraint.package), default: []].append(versionedBasedConstraint)
                         }
                     case .revision:
-                        constraints.append(dependency)
+                        enqueue(dependency)
                     case .unversioned:
                         throw DependencyResolverError.revisionDependencyContainsLocalPackage(
                             dependency: package.identity.description,

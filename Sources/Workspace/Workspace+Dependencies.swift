@@ -41,6 +41,7 @@ import class PackageGraph.ResolvedPackagesStore
 import struct PackageGraph.PubGrubDependencyResolver
 import struct PackageGraph.Term
 import class PackageLoading.ManifestLoader
+import struct PackageModel.EnabledTraits
 import enum PackageModel.PackageDependency
 import struct PackageModel.PackageIdentity
 import struct PackageModel.PackageReference
@@ -725,10 +726,12 @@ extension Workspace {
             rootDependencies: root.dependencies,
             observabilityScope: observabilityScope
         )
+        let knownEnabledTraits = self.knownEnabledTraits
         let resolver = try self.createResolver(
             resolvedPackages: resolvedPackagesStore.resolvedPackages,
             prefetchPackages: packagesToWarm,
             prefetchedContainers: prefetchedContainers,
+            knownEnabledTraits: knownEnabledTraits,
             observabilityScope: observabilityScope
         )
         self.activeResolver = resolver
@@ -765,6 +768,18 @@ extension Workspace {
         // If we still have missing packages, something is fundamentally wrong with the resolution of the graph
         let stillMissingPackages = try updatedDependencyManifests.missingPackages
         guard stillMissingPackages.isEmpty else {
+            // Loading the resolved manifests can enable traits that resolution did not know about: a
+            // package may request traits on a dependency that resolution does not follow, because none
+            // of its targets use it. Resolve again with those traits. Traits only ever grow, so this ends.
+            if self.knownEnabledTraits != knownEnabledTraits {
+                return try await self.resolveAndUpdateResolvedFile(
+                    root: root,
+                    explicitProduct: explicitProduct,
+                    forceResolution: forceResolution,
+                    constraints: constraints,
+                    observabilityScope: observabilityScope
+                )
+            }
             observabilityScope.emit(BinaryArtifactsManagerError.exhaustedAttempts(missing: stillMissingPackages))
             return updatedDependencyManifests
         }
@@ -1286,6 +1301,7 @@ extension Workspace {
         skipUpdateForResolvedPackages: Bool = false,
         prefetchPackages: [PackageReference] = [],
         prefetchedContainers: [PackageReference: any PackageContainer] = [:],
+        knownEnabledTraits: [PackageIdentity: EnabledTraits] = [:],
         observabilityScope: ObservabilityScope
     ) throws -> PubGrubDependencyResolver {
         var delegate: DependencyResolverDelegate
@@ -1309,9 +1325,17 @@ extension Workspace {
             skipDependenciesUpdates: self.configuration.skipDependenciesUpdates,
             skipUpdateForResolvedPackages: skipUpdateForResolvedPackages,
             prefetchBasedOnResolvedFile: self.configuration.prefetchBasedOnResolvedFile,
+            knownEnabledTraits: knownEnabledTraits,
             observabilityScope: observabilityScope,
             delegate: delegate
         )
+    }
+
+    /// The traits enabled for each package so far, as `enabledTraitsMap` computed them from every
+    /// loaded manifest.
+    fileprivate var knownEnabledTraits: [PackageIdentity: EnabledTraits] {
+        let identities = self.enabledTraitsMap.dictionaryLiteral.keys
+        return Dictionary(uniqueKeysWithValues: identities.map { ($0, self.enabledTraitsMap[$0]) })
     }
 
     /// Builds the list of packages to prefetch before PubGrub runs.
