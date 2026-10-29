@@ -3438,6 +3438,9 @@ public class MockContainer: PackageContainer {
 
     public var unversionedDeps: [PackageContainerConstraint] = []
 
+    /// The traits this package requests of each dependency, by identity.
+    var traitsRequestedOfDependencies: [String: Set<String>] = [:]
+
     /// The list of versions that have incompatible tools version.
     var toolsVersion: ToolsVersion = ToolsVersion.current
     var versionsToolsVersions = [Version: ToolsVersion]()
@@ -3490,12 +3493,23 @@ public class MockContainer: PackageContainer {
             throw _MockLoadingError.unknownRevision
         }
         var filteredDependencies: [MockContainer.Dependency] = []
-        for (product, productDependencies) in revisionDependencies where productFilter.contains(product) {
+        for (product, productDependencies) in revisionDependencies {
+            // A key `product+Trait` lists the product's dependencies that `Trait` guards.
+            let parts = product.split(separator: "+", maxSplits: 1).map(String.init)
+            guard productFilter.contains(parts[0]), parts.count == 1 || enabledTraits.contains(parts[1]) else { continue }
             filteredDependencies.append(contentsOf: productDependencies)
         }
         return filteredDependencies.map({ value in
             let (package, requirement, filter) = value
-            return PackageContainerConstraint(package: package, requirement: requirement, products: filter)
+            guard let traits = self.traitsRequestedOfDependencies[package.identity.description] else {
+                return PackageContainerConstraint(package: package, requirement: requirement, products: filter)
+            }
+            return PackageContainerConstraint(
+                package: package,
+                requirement: requirement,
+                products: filter,
+                enabledTraits: EnabledTraits(traits, setBy: .package(.init(stringLiteral: self.package.identity.description)))
+            )
         })
     }
 
@@ -3713,6 +3727,11 @@ class DependencyGraphBuilder {
             container.dependencies[version.description, default: [:]][product, default: []] += packageDependencies
         }
         self.containers[packageReference.identity.description] = container
+    }
+
+    /// Makes `package` request `traits` of its dependency `dependency`.
+    func requestTraits(_ traits: Set<String>, of dependency: String, from package: String) throws {
+        try XCTUnwrap(self.containers[package]).traitsRequestedOfDependencies[dependency] = traits
     }
 
     /// Creates a `Package.resolved` store with the given resolution results.
@@ -3974,5 +3993,107 @@ extension Result where Success == [DependencyResolverBinding] {
             XCTFail("Unexpected result \(self)")
         }
         return nil
+    }
+}
+
+// Branch-based and local packages are expanded before PubGrub runs; every request for one must be expanded
+// with the union of the products and traits that all of its requests ask for.
+extension PubGrubTests {
+    private func constraint(
+        _ package: String,
+        _ products: Set<String>,
+        traits: Set<String> = ["default"]
+    ) throws -> PackageContainerConstraint {
+        try PackageContainerConstraint(
+            package: builder.reference(for: package),
+            requirement: .revision("main"),
+            products: .specific(products),
+            enabledTraits: EnabledTraits(traits, setBy: .package("root"))
+        )
+    }
+
+    func testBranchPackageRequestedTwiceAtTopLevelWithDifferentTraits() async throws {
+        try builder.serve("b", at: .revision("main"), with: ["b+T": ["c": (.revision("main"), .specific(["c"]))]])
+        try builder.serve("c", at: .revision("main"))
+
+        let result = await builder.create().solve(constraints: [
+            try constraint("b", ["b"]),
+            try constraint("b", ["b"], traits: ["T"]),
+        ])
+
+        AssertResult(result, [("b", .revision("main")), ("c", .revision("main"))])
+    }
+
+    func testBranchPackageRequestedForDifferentProducts() async throws {
+        try builder.serve("b", at: .revision("main"), with: ["b2": ["d": (.revision("main"), .specific(["d"]))]])
+        try builder.serve("d", at: .revision("main"))
+
+        let result = await builder.create().solve(constraints: [
+            try constraint("b", ["b1"]),
+            try constraint("b", ["b2"]),
+        ])
+
+        AssertResult(result, [("b", .revision("main")), ("d", .revision("main"))])
+    }
+
+    func testBranchPackageTraitArrivesAfterItsProducts() async throws {
+        try builder.serve("b", at: .revision("main"), with: ["b2+T": ["d": (.revision("main"), .specific(["d"]))]])
+        try builder.serve("d", at: .revision("main"))
+
+        let result = await builder.create().solve(constraints: [
+            try constraint("b", ["b2"]),
+            try constraint("b", ["b1"], traits: ["T"]),
+        ])
+
+        AssertResult(result, [("b", .revision("main")), ("d", .revision("main"))])
+    }
+
+    func testBranchPackageCycleWithTraits() async throws {
+        try builder.serve("b", at: .revision("main"), with: [
+            "b": ["m": (.revision("main"), .specific(["m"]))],
+            "b+T": ["c": (.revision("main"), .specific(["c"]))],
+        ])
+        try builder.serve("m", at: .revision("main"), with: ["m": ["b": (.revision("main"), .specific(["b"]))]])
+        try builder.serve("c", at: .revision("main"))
+
+        let result = await builder.create().solve(constraints: [
+            try constraint("b", ["b"]),
+            try constraint("m", ["m"]),
+            try constraint("b", ["b"], traits: ["T"]),
+        ])
+
+        AssertResult(result, [("b", .revision("main")), ("m", .revision("main")), ("c", .revision("main"))])
+    }
+
+    func testPinnedBranchPackageKeepsEveryRequestedProduct() async throws {
+        try builder.serve("b", at: .revision("abc"), with: ["b2+T": ["d": (.revision("main"), .specific(["d"]))]])
+        try builder.serve("d", at: .revision("main"))
+        let pins = try builder.create(resolvedPackages: ["b": (.branch(name: "main", revision: "abc"), .specific(["b1"]))])
+
+        let result = await builder.create(resolvedPackages: pins.resolvedPackages).solve(constraints: [
+            try constraint("b", ["b1"]),
+            try constraint("b", ["b2"], traits: ["T"]),
+        ])
+
+        AssertResult(result, [("b", .revision("abc", branch: "main")), ("d", .revision("main"))])
+        let products = try? result.get().first { $0.package.identity == .plain("b") }?.products
+        XCTAssertEqual(products, .specific(["b1", "b2"]))
+    }
+}
+
+extension PubGrubTests {
+    /// The trait arrives through the cycle's back-edge, after the package was first expanded without it.
+    func testBranchPackageCycleTraitArrivesThroughBackEdge() async throws {
+        try builder.serve("b", at: .revision("main"), with: [
+            "b": ["m": (.revision("main"), .specific(["m"]))],
+            "b+T": ["c": (.revision("main"), .specific(["c"]))],
+        ])
+        try builder.serve("m", at: .revision("main"), with: ["m": ["b": (.revision("main"), .specific(["b"]))]])
+        try builder.requestTraits(["T"], of: "b", from: "m")
+        try builder.serve("c", at: .revision("main"))
+
+        let result = await builder.create().solve(constraints: [try constraint("b", ["b"])])
+
+        AssertResult(result, [("b", .revision("main")), ("m", .revision("main")), ("c", .revision("main"))])
     }
 }

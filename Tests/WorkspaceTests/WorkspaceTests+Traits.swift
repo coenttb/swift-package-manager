@@ -2875,4 +2875,127 @@ extension WorkspaceTests {
             XCTAssertEqual(traitlessPackage?.enabledTraits, ["default"])
         }
     }
+
+    /// The diamond of local packages from #10485: one parent asks for the shared package's defaults, the
+    /// other for its trait, and the dependency that trait guards is resolved in either order.
+    func testLocalPackageDiamondExpandsTraitsRequestedByEitherParent() async throws {
+        for parents in [["Second", "Third"], ["Third", "Second"]] {
+            let sandbox = AbsolutePath("/tmp/ws/")
+            let fs = InMemoryFileSystem()
+
+            func parent(_ name: String, traits: Set<PackageDependency.Trait>) throws -> MockPackage {
+                MockPackage(
+                    name: name,
+                    targets: [try MockTarget(name: "\(name)Target", dependencies: [.product(name: "LibraryProduct", package: "Library")])],
+                    products: [MockProduct(name: "\(name)Product", modules: ["\(name)Target"])],
+                    dependencies: [.fileSystem(path: "./Library", traits: traits)],
+                    versions: [nil]
+                )
+            }
+            let workspace = try await MockWorkspace(
+                sandbox: sandbox,
+                fileSystem: fs,
+                roots: [
+                    MockPackage(
+                        name: "Root",
+                        targets: [try MockTarget(name: "RootTarget", dependencies: parents.map { .product(name: "\($0)Product", package: $0) })],
+                        dependencies: parents.map { .fileSystem(path: "./\($0)") }
+                    )
+                ],
+                packages: [
+                    try parent("Second", traits: ["default"]),
+                    try parent("Third", traits: ["Trait"]),
+                    MockPackage(
+                        name: "Library",
+                        targets: [
+                            MockTarget(
+                                name: "LibraryTarget",
+                                dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                            )
+                        ],
+                        products: [MockProduct(name: "LibraryProduct", modules: ["LibraryTarget"])],
+                        dependencies: [.fileSystem(path: "./Guarded")],
+                        traits: ["Trait"],
+                        versions: [nil]
+                    ),
+                    MockPackage(
+                        name: "Guarded",
+                        targets: [MockTarget(name: "GuardedTarget")],
+                        products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                        versions: [nil]
+                    ),
+                ]
+            )
+
+            try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+                PackageGraphTesterXCTest(graph) { result in
+                    result.check(packages: "Root", "Second", "Third", "Library", "Guarded")
+                }
+                XCTAssertNoDiagnostics(diagnostics)
+            }
+        }
+    }
+
+    /// A branch-based parent requests another product and a trait of a package that a local package overrides.
+    func testBranchParentRequestsMoreOfLocallyOverriddenPackage() async throws {
+        let workspace = try await MockWorkspace(
+            sandbox: AbsolutePath("/tmp/ws/"),
+            fileSystem: InMemoryFileSystem(),
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "BaseProduct", package: "Shared"),
+                                .product(name: "ParentProduct", package: "Parent"),
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "./Shared"),
+                        .sourceControl(path: "./Parent", requirement: .branch("main")),
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "Parent",
+                    targets: [MockTarget(name: "ParentTarget", dependencies: [.product(name: "ExtraProduct", package: "Shared")])],
+                    products: [MockProduct(name: "ParentProduct", modules: ["ParentTarget"])],
+                    dependencies: [.sourceControl(path: "./Shared", requirement: .branch("main"), traits: ["Trait"])],
+                    versions: ["main"]
+                ),
+                MockPackage(
+                    name: "Shared",
+                    targets: [
+                        MockTarget(name: "BaseTarget"),
+                        MockTarget(
+                            name: "ExtraTarget",
+                            dependencies: [.product(name: "GuardedProduct", package: "Guarded", condition: .init(traits: ["Trait"]))]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "BaseProduct", modules: ["BaseTarget"]),
+                        MockProduct(name: "ExtraProduct", modules: ["ExtraTarget"]),
+                    ],
+                    dependencies: [.fileSystem(path: "./Guarded")],
+                    traits: ["Trait"],
+                    versions: [nil, "main"]
+                ),
+                MockPackage(
+                    name: "Guarded",
+                    targets: [MockTarget(name: "GuardedTarget")],
+                    products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                    versions: [nil]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in result.check(packages: "Root", "Parent", "Shared", "Guarded") }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+    }
 }
